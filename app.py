@@ -1,19 +1,18 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────────
 # KONSTANTA
 # ──────────────────────────────────────────────────────────────────────────────
 
 GRADE_LABELS  = ["A", "B", "C", "D", "E"]
-GRADE_COLORS  = {"A": "#639922", "B": "#378ADD", "C": "#EF9F27", "D": "#D85A30", "E": "#E24B4A"}
 GRADE_TEXT_FG = {"A": "#27500A", "B": "#0C447C", "C": "#633806", "D": "#712B13", "E": "#791F1F"}
 GRADE_ICONS   = {"A": "🟢",      "B": "🔵",      "C": "🟡",      "D": "🟠",      "E": "🔴"}
 
 SUGENO_K = {"A": 95, "B": 77, "C": 65, "D": 55, "E": 35}
 
-# Fungsi keanggotaan trapezoid per grade
 TRAP_PARAMS = {
     "A": (83,  87, 100, 100),
     "B": (67,  72,  82,  87),
@@ -23,9 +22,38 @@ TRAP_PARAMS = {
 }
 
 # Bobot komponen nilai
-W_AQ   = 0.20   # Avg(Tugas + Kuis)
-W_PROJ = 0.30   # Projek
-W_MID  = 0.40   # UTS
+W_MID   = 0.40   # Midterm
+W_QUIZ  = 0.30   # Quizzes_Avg
+W_STUDY = 0.20   # Study_Hours (dinormalisasi 0–100)
+W_SLEEP = 0.10   # Sleep_Hours (dinormalisasi 0–100)
+# Stress digunakan sebagai pengurang bonus
+
+# Kolom wajib di file (Nama opsional, Grade diabaikan)
+REQUIRED_COLS = ["Midterm_Score", "Quizzes_Avg", "Study_Hours_per_Week",
+                 "Stress_Level (1-10)", "Sleep_Hours_per_Night"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NORMALISASI INPUT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def norm_study(h: float) -> float:
+    """Study hours/week → 0–100. Asumsi max belajar ideal = 40 jam/minggu."""
+    return float(np.clip(h / 40 * 100, 0, 100))
+
+def norm_sleep(h: float) -> float:
+    """Sleep hours/night → 0–100. Optimal 7–9 jam = 100, kurang/lebih dikurangi."""
+    h = float(np.clip(h, 0, 12))
+    if 7 <= h <= 9:
+        return 100.0
+    if h < 7:
+        return h / 7 * 100
+    return max(0, 100 - (h - 9) * 20)
+
+def stress_penalty(s: float) -> float:
+    """Stress level 1–10 → penalti 0–15 poin dari skor akhir."""
+    s = float(np.clip(s, 1, 10))
+    return (s - 1) / 9 * 15
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -33,7 +61,6 @@ W_MID  = 0.40   # UTS
 # ──────────────────────────────────────────────────────────────────────────────
 
 def trapmf(x: float, a: float, b: float, c: float, d: float) -> float:
-    """Fungsi keanggotaan trapezoid."""
     if x <= a or x >= d:
         return 0.0
     if b <= x <= c:
@@ -43,29 +70,24 @@ def trapmf(x: float, a: float, b: float, c: float, d: float) -> float:
     return (d - x) / (d - c)
 
 
-def get_membership(score: float) -> dict[str, float]:
-    """Hitung derajat keanggotaan untuk semua grade."""
+def get_membership(score: float) -> dict:
     return {g: trapmf(score, *TRAP_PARAMS[g]) for g in GRADE_LABELS}
 
 
-def attendance_bonus(att: float) -> float:
-    """Bonus kehadiran: max +10 untuk kehadiran >= 90%."""
-    att = float(np.clip(att, 0, 100))
-    if att >= 90:
-        return 10.0
-    if att >= 60:
-        return (att - 60) / 30 * 10
-    return 0.0
-
-
-def hitung_skor_dasar(assign: float, quiz: float, proj: float, mid: float, att: float) -> dict:
-    """Hitung skor terbobot sebelum defuzzifikasi."""
-    aq       = (assign + quiz) / 2
-    weighted = aq * W_AQ + proj * W_PROJ + mid * W_MID
-    bonus    = attendance_bonus(att)
-    final    = float(np.clip(weighted + bonus, 0, 100))
-    return {"aq": round(aq, 2), "weighted": round(weighted, 2),
-            "bonus": round(bonus, 2), "final": round(final, 2)}
+def hitung_skor_dasar(mid: float, quiz: float, study: float,
+                      stress: float, sleep: float) -> dict:
+    study_n  = norm_study(study)
+    sleep_n  = norm_sleep(sleep)
+    weighted = mid * W_MID + quiz * W_QUIZ + study_n * W_STUDY + sleep_n * W_SLEEP
+    penalty  = stress_penalty(stress)
+    final    = float(np.clip(weighted - penalty, 0, 100))
+    return {
+        "study_n":  round(study_n, 2),
+        "sleep_n":  round(sleep_n, 2),
+        "weighted": round(weighted, 2),
+        "penalty":  round(penalty, 2),
+        "final":    round(final, 2),
+    }
 
 
 def to_grade(score: float) -> str:
@@ -80,17 +102,13 @@ def to_grade(score: float) -> str:
 # METODE MAMDANI
 # ──────────────────────────────────────────────────────────────────────────────
 
-def hitung_mamdani(assign: float, quiz: float, proj: float, mid: float, att: float) -> dict:
-    """
-    Defuzzifikasi Mamdani menggunakan metode centroid.
-    Output berupa kurva agregasi kontinu yang di-clip oleh firing strength.
-    """
-    base = hitung_skor_dasar(assign, quiz, proj, mid, att)
-    mu   = get_membership(base["final"])
+def hitung_mamdani(mid: float, quiz: float, study: float,
+                   stress: float, sleep: float) -> dict:
+    base  = hitung_skor_dasar(mid, quiz, study, stress, sleep)
+    mu    = get_membership(base["final"])
 
     x_out = np.linspace(0, 100, 1000)
     agg   = np.zeros_like(x_out)
-
     for g in GRADE_LABELS:
         clipped = np.array([min(mu[g], trapmf(xi, *TRAP_PARAMS[g])) for xi in x_out])
         agg     = np.maximum(agg, clipped)
@@ -99,13 +117,11 @@ def hitung_mamdani(assign: float, quiz: float, proj: float, mid: float, att: flo
     defuzz = round(float(np.sum(x_out * agg) / denom) if denom > 0 else base["final"], 2)
 
     return {
-        "method":   "Mamdani",
-        **base,
-        "mu":       {g: round(v, 4) for g, v in mu.items()},
-        "defuzz":   defuzz,
-        "grade":    to_grade(defuzz),
-        "agg":      agg,
-        "x_out":    x_out,
+        "method": "Mamdani", **base,
+        "mu":     {g: round(v, 4) for g, v in mu.items()},
+        "defuzz": defuzz,
+        "grade":  to_grade(defuzz),
+        "agg":    agg, "x_out": x_out,
     }
 
 
@@ -113,29 +129,24 @@ def hitung_mamdani(assign: float, quiz: float, proj: float, mid: float, att: flo
 # METODE SUGENO
 # ──────────────────────────────────────────────────────────────────────────────
 
-def hitung_sugeno(assign: float, quiz: float, proj: float, mid: float, att: float) -> dict:
-    """
-    Defuzzifikasi Sugeno menggunakan weighted average dari konstanta output
-    (singleton) per rule.
-    """
-    base = hitung_skor_dasar(assign, quiz, proj, mid, att)
-    mu   = get_membership(base["final"])
-
+def hitung_sugeno(mid: float, quiz: float, study: float,
+                  stress: float, sleep: float) -> dict:
+    base   = hitung_skor_dasar(mid, quiz, study, stress, sleep)
+    mu     = get_membership(base["final"])
     num    = sum(mu[g] * SUGENO_K[g] for g in GRADE_LABELS)
     den    = sum(mu.values())
     defuzz = round(num / den if den != 0 else base["final"], 2)
 
     return {
-        "method":  "Sugeno",
-        **base,
-        "mu":      {g: round(v, 4) for g, v in mu.items()},
-        "defuzz":  defuzz,
-        "grade":   to_grade(defuzz),
+        "method": "Sugeno", **base,
+        "mu":     {g: round(v, 4) for g, v in mu.items()},
+        "defuzz": defuzz,
+        "grade":  to_grade(defuzz),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HELPER GRAFIK
+# GRAFIK
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _style_ax(ax, title: str, xlabel: str, ylabel: str):
@@ -153,9 +164,7 @@ def _style_ax(ax, title: str, xlabel: str, ylabel: str):
 
 
 def _plot_membership_panel(ax, final: float, title: str):
-    """Panel kiri: fungsi keanggotaan trapezoid + garis skor."""
     x = np.linspace(0, 100, 600)
-
     for g in GRADE_LABELS:
         y = np.array([trapmf(xi, *TRAP_PARAMS[g]) for xi in x])
         ax.plot(x, y, color="black", linewidth=1.2)
@@ -165,7 +174,6 @@ def _plot_membership_panel(ax, final: float, title: str):
 
     ax.axvline(final, color="red", linewidth=1.2, linestyle="--")
     ax.text(final + 0.5, 1.12, f"Skor: {final}", color="red", fontsize=8)
-
     for g in GRADE_LABELS:
         val = trapmf(final, *TRAP_PARAMS[g])
         if val > 0.01:
@@ -176,17 +184,11 @@ def _plot_membership_panel(ax, final: float, title: str):
     _style_ax(ax, title, "Skor", "μ (Derajat Keanggotaan)")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GRAFIK MAMDANI
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_mamdani(r: dict) -> plt.Figure:
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     fig.patch.set_facecolor("white")
-
     _plot_membership_panel(ax1, r["final"], "Fungsi Keanggotaan — Mamdani")
 
-    # Panel kanan: kurva agregasi + centroid
     ax2.fill_between(r["x_out"], r["agg"], alpha=0.25, color="steelblue")
     ax2.plot(r["x_out"], r["agg"], color="black", linewidth=1.2)
     ax2.axvline(r["defuzz"], color="red", linewidth=1.5, linestyle="--")
@@ -199,20 +201,13 @@ def plot_mamdani(r: dict) -> plt.Figure:
     return fig
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GRAFIK SUGENO
-# ──────────────────────────────────────────────────────────────────────────────
-
 def plot_sugeno(r: dict) -> plt.Figure:
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
     fig.patch.set_facecolor("white")
-
     _plot_membership_panel(ax1, r["final"], "Fungsi Keanggotaan — Sugeno")
 
-    # Panel kanan: singleton output
     k_vals  = [SUGENO_K[g] for g in GRADE_LABELS]
     mu_vals = [r["mu"][g]  for g in GRADE_LABELS]
-
     for kv, mv, g in zip(k_vals, mu_vals, GRADE_LABELS):
         ax2.vlines(kv, 0, mv, colors="black", linewidth=2)
         ax2.plot(kv, mv, "o", color="black", markersize=6, zorder=5)
@@ -228,11 +223,7 @@ def plot_sugeno(r: dict) -> plt.Figure:
     return fig
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GRAFIK PERBANDINGAN
-# ──────────────────────────────────────────────────────────────────────────────
-
-def plot_perbandingan(hasil_list: list[dict]) -> plt.Figure:
+def plot_perbandingan(hasil_list: list) -> plt.Figure:
     names = [h["nama"]              for h in hasil_list]
     mam   = [h["mamdani"]["defuzz"] for h in hasil_list]
     sug   = [h["sugeno"]["defuzz"]  for h in hasil_list]
@@ -275,8 +266,7 @@ def plot_perbandingan(hasil_list: list[dict]) -> plt.Figure:
 # KOMPONEN UI
 # ──────────────────────────────────────────────────────────────────────────────
 
-def tampilkan_ringkasan_grade(hasil_list: list[dict], key: str):
-    """Tampilkan metrik jumlah mahasiswa per grade."""
+def tampilkan_ringkasan_grade(hasil_list: list, key: str):
     count = {g: sum(1 for h in hasil_list if h[key]["grade"] == g) for g in GRADE_LABELS}
     cols  = st.columns(5)
     for i, g in enumerate(GRADE_LABELS):
@@ -285,17 +275,20 @@ def tampilkan_ringkasan_grade(hasil_list: list[dict], key: str):
 
 
 def tampilkan_kartu_mahasiswa(h: dict, key: str):
-    """Tampilkan kartu hasil satu mahasiswa."""
     r = h[key]
     with st.container(border=True):
         col_info, col_grade = st.columns([4, 1])
         with col_info:
             st.markdown(f"**{h['nama']}**")
             st.caption(
-                f"Subtotal 90%: {r['weighted']} | "
-                f"Bonus: +{r['bonus']} | "
-                f"Skor: {r['final']} | "
-                f"Defuzz: {r['defuzz']}"
+                f"Midterm: {h['mid']} | Quizzes: {h['quiz']} | "
+                f"Study: {h['study']}h/week | Sleep: {h['sleep']}h/night | "
+                f"Stress: {h['stress']}/10"
+            )
+            st.caption(
+                f"Skor terbobot: {r['weighted']} | "
+                f"Penalti stress: -{r['penalty']} | "
+                f"Skor final: {r['final']} | Defuzz: {r['defuzz']}"
             )
             for g in GRADE_LABELS:
                 v = float(r["mu"][g])
@@ -304,10 +297,62 @@ def tampilkan_kartu_mahasiswa(h: dict, key: str):
         with col_grade:
             st.markdown(
                 f"<div style='text-align:center;font-size:42px;"
-                f"font-weight:600;color:{GRADE_TEXT_FG[r['grade']]}'>"
+                f"font-weight:600;color:{GRADE_TEXT_FG[r[\"grade\"]]}'>"
                 f"{r['grade']}</div>",
                 unsafe_allow_html=True,
             )
+
+
+def parse_upload(uploaded_file) -> tuple:
+    """Baca file, validasi kolom, kembalikan (data_mhs, error_msg)."""
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        return None, f"Gagal membaca file: {e}"
+
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        return None, f"Kolom tidak ditemukan: **{', '.join(missing)}**"
+
+    data_mhs = []
+    for i, row in df.iterrows():
+        try:
+            nama = str(row["Nama"]).strip() if "Nama" in df.columns else f"Mahasiswa {i+1}"
+            data_mhs.append({
+                "nama":  nama or f"Mahasiswa {i+1}",
+                "mid":   float(row["Midterm_Score"]),
+                "quiz":  float(row["Quizzes_Avg"]),
+                "study": float(row["Study_Hours_per_Week"]),
+                "stress":float(row["Stress_Level (1-10)"]),
+                "sleep": float(row["Sleep_Hours_per_Night"]),
+            })
+        except Exception as e:
+            return None, f"Error pada baris {i+2}: {e}"
+
+    return data_mhs, None
+
+
+def buat_export_csv(hasil_list: list) -> bytes:
+    rows = []
+    for h in hasil_list:
+        rows.append({
+            "Nama":                  h["nama"],
+            "Midterm_Score":         h["mid"],
+            "Quizzes_Avg":           h["quiz"],
+            "Study_Hours_per_Week":  h["study"],
+            "Stress_Level (1-10)":   h["stress"],
+            "Sleep_Hours_per_Night": h["sleep"],
+            "Mamdani_Defuzz":        h["mamdani"]["defuzz"],
+            "Mamdani_Grade":         h["mamdani"]["grade"],
+            "Sugeno_Defuzz":         h["sugeno"]["defuzz"],
+            "Sugeno_Grade":          h["sugeno"]["grade"],
+            "Selisih_Defuzz":        round(abs(h["mamdani"]["defuzz"] - h["sugeno"]["defuzz"]), 2),
+            "Grade_Sama":            h["mamdani"]["grade"] == h["sugeno"]["grade"],
+        })
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -317,84 +362,111 @@ def tampilkan_kartu_mahasiswa(h: dict, key: str):
 def main():
     st.set_page_config(page_title="Fuzzy Grade Calculator", page_icon="🎓", layout="centered")
     st.title("🎓 Fuzzy Logic Grade Calculator")
-    st.caption("Mamdani & Sugeno · Tugas+Kuis 20% · Projek 30% · UTS 40% · Kehadiran bonus max +10")
+    st.caption(
+        "Mamdani & Sugeno · Midterm 40% · Quizzes 30% · Study Hours 20% · Sleep 10% · "
+        "Stress Level sebagai penalti (max −15)"
+    )
 
-    n = st.number_input("Masukkan jumlah mahasiswa", min_value=1, max_value=50, value=2, step=1)
+    mode = st.radio("Mode input data:", ["📂 Upload File (Excel/CSV)", "✏️ Input Manual"],
+                    horizontal=True)
     st.divider()
 
-    # ── Form input mahasiswa
-    with st.form("input_form"):
-        data_mhs = []
-        for i in range(1, int(n) + 1):
-            st.markdown(f"**Mahasiswa {i}**")
-            nama = st.text_input("Nama", key=f"nama_{i}", placeholder=f"Nama mahasiswa {i}")
-            c1, c2 = st.columns(2)
-            with c1:
-                assign = st.number_input(f"Avg Tugas (Mhs {i})",   0.0, 100.0, 75.0, key=f"assign_{i}")
-                proj   = st.number_input(f"Skor Projek (Mhs {i})", 0.0, 100.0, 75.0, key=f"proj_{i}")
-                att    = st.number_input(f"Kehadiran % (Mhs {i})", 0.0, 100.0, 80.0, key=f"att_{i}")
-            with c2:
-                quiz = st.number_input(f"Avg Kuis (Mhs {i})", 0.0, 100.0, 75.0, key=f"quiz_{i}")
-                mid  = st.number_input(f"Skor UTS (Mhs {i})", 0.0, 100.0, 75.0, key=f"mid_{i}")
-            data_mhs.append({
-                "nama": nama or f"Mahasiswa {i}",
-                "assign": assign, "quiz": quiz,
-                "proj": proj, "mid": mid, "att": att,
-            })
-            st.markdown("---")
+    data_mhs = []
 
-        submitted = st.form_submit_button(
-            "🔍 Hitung dengan Mamdani & Sugeno",
-            use_container_width=True,
-            type="primary",
-        )
+    # ── MODE UPLOAD
+    if mode == "📂 Upload File (Excel/CSV)":
+        st.markdown("**Kolom yang dibutuhkan:**")
+        st.code("Nama (opsional) | Midterm_Score | Quizzes_Avg | Study_Hours_per_Week | Stress_Level (1-10) | Sleep_Hours_per_Night")
+        st.caption("Kolom `Grade` di file akan diabaikan.")
 
-    # ── Hitung & tampilkan hasil
-    if not submitted:
+        uploaded = st.file_uploader("Upload file Excel (.xlsx) atau CSV (.csv)",
+                                    type=["xlsx", "xls", "csv"])
+        if uploaded:
+            data_mhs, err = parse_upload(uploaded)
+            if err:
+                st.error(err)
+                data_mhs = []
+            else:
+                st.success(f"✅ {len(data_mhs)} mahasiswa berhasil dibaca.")
+                uploaded.seek(0)
+                df_prev = pd.read_csv(uploaded) if uploaded.name.endswith(".csv") else pd.read_excel(uploaded)
+                show_cols = [c for c in ["Nama"] + REQUIRED_COLS if c in df_prev.columns]
+                st.dataframe(df_prev[show_cols], use_container_width=True)
+
+        hitung = st.button("🔍 Hitung dengan Mamdani & Sugeno",
+                           use_container_width=True, type="primary",
+                           disabled=len(data_mhs) == 0)
+
+    # ── MODE MANUAL
+    else:
+        n = st.number_input("Jumlah mahasiswa", min_value=1, max_value=50, value=2, step=1)
+        with st.form("input_form"):
+            for i in range(1, int(n) + 1):
+                st.markdown(f"**Mahasiswa {i}**")
+                nama = st.text_input("Nama", key=f"nama_{i}", placeholder=f"Nama mahasiswa {i}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    mid    = st.number_input("Midterm_Score (0–100)",        0.0, 100.0, 75.0, key=f"mid_{i}")
+                    study  = st.number_input("Study_Hours_per_Week (0–40)",  0.0,  40.0, 10.0, key=f"study_{i}")
+                    sleep  = st.number_input("Sleep_Hours_per_Night (0–12)", 0.0,  12.0,  7.0, key=f"sleep_{i}")
+                with c2:
+                    quiz   = st.number_input("Quizzes_Avg (0–100)",          0.0, 100.0, 75.0, key=f"quiz_{i}")
+                    stress = st.number_input("Stress_Level (1–10)",          1.0,  10.0,  5.0, key=f"stress_{i}")
+                data_mhs.append({
+                    "nama": nama or f"Mahasiswa {i}",
+                    "mid": mid, "quiz": quiz, "study": study,
+                    "stress": stress, "sleep": sleep,
+                })
+                st.markdown("---")
+            hitung = st.form_submit_button("🔍 Hitung dengan Mamdani & Sugeno",
+                                           use_container_width=True, type="primary")
+
+    # ── HITUNG & TAMPILKAN
+    if not hitung or not data_mhs:
         return
 
     hasil_list = [
         {
             "nama":    d["nama"],
-            "mamdani": hitung_mamdani(d["assign"], d["quiz"], d["proj"], d["mid"], d["att"]),
-            "sugeno":  hitung_sugeno( d["assign"], d["quiz"], d["proj"], d["mid"], d["att"]),
+            "mid":     d["mid"],   "quiz":   d["quiz"],
+            "study":   d["study"], "stress": d["stress"], "sleep": d["sleep"],
+            "mamdani": hitung_mamdani(d["mid"], d["quiz"], d["study"], d["stress"], d["sleep"]),
+            "sugeno":  hitung_sugeno( d["mid"], d["quiz"], d["study"], d["stress"], d["sleep"]),
         }
         for d in data_mhs
     ]
 
+    csv_bytes = buat_export_csv(hasil_list)
+    st.download_button("⬇️ Download Hasil (.csv)", data=csv_bytes,
+                       file_name="hasil_fuzzy_grade.csv", mime="text/csv")
+    st.divider()
+
     tab_mam, tab_sug, tab_vs = st.tabs(["📐 Mamdani", "📏 Sugeno", "⚖️ Perbandingan"])
 
-    # ── Tab Mamdani
     with tab_mam:
         st.markdown("### Metode Mamdani")
         st.caption("Defuzzifikasi: **Centroid** dari kurva output teragregasi (area-based)")
         tampilkan_ringkasan_grade(hasil_list, "mamdani")
         st.divider()
-
         for h in hasil_list:
             tampilkan_kartu_mahasiswa(h, "mamdani")
             st.markdown(f"**📈 Grafik Mamdani — {h['nama']}**")
             fig = plot_mamdani(h["mamdani"])
-            st.pyplot(fig)
-            plt.close(fig)
+            st.pyplot(fig); plt.close(fig)
             st.markdown("---")
 
-    # ── Tab Sugeno
     with tab_sug:
         st.markdown("### Metode Sugeno")
         st.caption("Defuzzifikasi: **Weighted Average** dari konstanta output tiap rule (singleton)")
         tampilkan_ringkasan_grade(hasil_list, "sugeno")
         st.divider()
-
         for h in hasil_list:
             tampilkan_kartu_mahasiswa(h, "sugeno")
             st.markdown(f"**📈 Grafik Sugeno — {h['nama']}**")
             fig = plot_sugeno(h["sugeno"])
-            st.pyplot(fig)
-            plt.close(fig)
+            st.pyplot(fig); plt.close(fig)
             st.markdown("---")
 
-    # ── Tab Perbandingan
     with tab_vs:
         st.markdown("### Mamdani vs Sugeno")
         st.caption(
@@ -402,15 +474,14 @@ def main():
             "Sugeno menggunakan nilai konstanta → weighted average."
         )
         fig_vs = plot_perbandingan(hasil_list)
-        st.pyplot(fig_vs)
-        plt.close(fig_vs)
-
+        st.pyplot(fig_vs); plt.close(fig_vs)
         st.divider()
+
         st.markdown("**Ringkasan perbedaan hasil:**")
         for h in hasil_list:
-            mam     = h["mamdani"]
-            sug     = h["sugeno"]
-            selisih = round(abs(mam["defuzz"] - sug["defuzz"]), 2)
+            mam        = h["mamdani"]
+            sug        = h["sugeno"]
+            selisih    = round(abs(mam["defuzz"] - sug["defuzz"]), 2)
             grade_info = (
                 "✅ Sama"
                 if mam["grade"] == sug["grade"]
@@ -418,10 +489,8 @@ def main():
             )
             st.markdown(
                 f"- **{h['nama']}** → "
-                f"Mamdani: `{mam['defuzz']}` | "
-                f"Sugeno: `{sug['defuzz']}` | "
-                f"Selisih: `{selisih}` | "
-                f"Grade: {grade_info}"
+                f"Mamdani: `{mam['defuzz']}` | Sugeno: `{sug['defuzz']}` | "
+                f"Selisih: `{selisih}` | Grade: {grade_info}"
             )
 
 
