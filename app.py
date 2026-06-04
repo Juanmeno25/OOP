@@ -297,7 +297,7 @@ def tampilkan_kartu_mahasiswa(h: dict, key: str):
         with col_grade:
             st.markdown(
                 f"<div style='text-align:center;font-size:42px;"
-                f"font-weight:600;color:{GRADE_TEXT_FG[r[\"grade\"]]}'>"
+                f"font-weight:600;color:{GRADE_TEXT_FG[r['grade']]}'>"
                 f"{r['grade']}</div>",
                 unsafe_allow_html=True,
             )
